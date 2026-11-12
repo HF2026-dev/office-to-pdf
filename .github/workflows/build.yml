@@ -1,0 +1,46 @@
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Build Mac app
+        run: pyinstaller --noconfirm --windowed --onefile --name "Office转PDF" office_to_pdf.py
+      - name: Check bundle
+        run: ls -la dist/ && file "dist/Office转PDF.app/Contents/MacOS/Office转PDF"
+      - name: Zip app
+        run: ditto -c -k --keepParent "dist/Office转PDF.app" Office转PDF_Mac_v1.0.zip && ls -la *.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Office转PDF_Mac_v1.0
+          path: Office转PDF_Mac_v1.0.zip
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Build Windows exe
+        run: pyinstaller --noconfirm --windowed --onefile --name "Office转PDF" office_to_pdf.py
+      - name: Check exe
+        run: Get-Item dist\Office转PDF.exe | Format-List Name,Length
+      - name: Zip exe
+        run: Compress-Archive -Path dist\Office转PDF.exe -DestinationPath Office转PDF_Windows_v1.0.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Office转PDF_Windows_v1.0
+          path: Office转PDF_Windows_v1.0.zip
