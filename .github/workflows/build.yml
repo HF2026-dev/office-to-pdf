@@ -6,21 +6,19 @@ on:
 
 jobs:
   build-mac:
-    # 用户的 Mac 是 Intel；GitHub 的 Intel 机子（macos-13）排队 1 小时没轮上，
-    # 改用 macos-15（ARM，充足）+ Rosetta 跑 x86_64 Python 打 Intel 版。
-    runs-on: macos-15
+    # 用户的 Mac 是 Intel。macos-13 排队 1 小时没机子，macos-15（ARM 池）两次 15 分钟
+    # 都没分到机子被取消（GitHub 容量问题，与代码无关）。
+    # 改用 macos-15-intel：独立的 Intel 机子池，原生 x86_64，不用 Rosetta。
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
-      - name: Install universal2 Python 3.12
-        run: |
-          curl -LO https://www.python.org/ftp/python/3.12.7/python-3.12.7-macos11.pkg
-          sudo installer -pkg python-3.12.7-macos11.pkg -target /
-          /usr/local/bin/python3.12 --version
-          arch -x86_64 /usr/local/bin/python3.12 --version
-      - name: Install PyInstaller (x86_64 under Rosetta)
-        run: arch -x86_64 /usr/local/bin/python3.12 -m pip install --upgrade pip pyinstaller
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
       - name: Build Mac app (Intel x86_64)
-        run: arch -x86_64 /usr/local/bin/python3.12 -m PyInstaller --noconfirm --windowed --onefile --target-arch x86_64 --name "Office转PDF" office_to_pdf.py
+        run: pyinstaller --noconfirm --windowed --onefile --name "Office转PDF" office_to_pdf.py
       - name: Check bundle arch
         run: |
           ls -la dist/
