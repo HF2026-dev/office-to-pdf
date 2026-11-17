@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Office转PDF v1.0
-把 Excel（.xls/.xlsx）和 Word（.doc/.docx）文件批量转换为 PDF。
-转换调用本机安装的免费 LibreOffice（soffice --headless），不联网、不上传文件。
+"""Office转PDF v1.1
+把 Excel（.xls/.xlsx）、Word（.doc/.docx）和图片
+（.png/.jpg/.jpeg/.bmp/.gif/.tif/.tiff/.webp）批量转换为 PDF。
+Office 文件调用本机安装的免费 LibreOffice（soffice --headless）转换；
+图片文件直接由本程序无损转换，不需要 LibreOffice。
+图片转换无损：JPEG（RGB/灰度、无 EXIF 旋转）原样嵌入，不重新压缩；
+其他格式经 Pillow 解码后用 Flate 无损压缩嵌入；透明图先合到白底上。
+不联网、不上传文件。
 用法：
   图形界面：直接双击运行（无参数）
-  命令行：  Office转PDF 文件1.xlsx 文件2.docx [-o 输出目录]
+  命令行：  Office转PDF 文件1.xlsx 图片1.png 文件2.docx [-o 输出目录]
             不加 -o 时输出到各源文件所在目录
 """
 import argparse
@@ -18,9 +23,11 @@ import tempfile
 import threading
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 APP_NAME = "Office转PDF"
-SUPPORTED = {".xls", ".xlsx", ".doc", ".docx"}
+OFFICE_EXTS = {".xls", ".xlsx", ".doc", ".docx"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
+SUPPORTED = OFFICE_EXTS | IMAGE_EXTS
 LIBREOFFICE_URL = "https://zh-cn.libreoffice.org/download/libreoffice/"
 
 
@@ -47,7 +54,7 @@ def find_soffice():
 
 
 def convert_file(soffice, src, outdir, timeout=300):
-    """转单个文件。返回 (是否成功, 说明文字)。"""
+    """转单个 Office 文件。返回 (是否成功, 说明文字)。"""
     src = Path(src)
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -70,6 +77,107 @@ def convert_file(soffice, src, outdir, timeout=300):
         shutil.rmtree(profile, ignore_errors=True)
 
 
+def image_to_pdf(src, outdir):
+    """把一张图片无损转成单页 PDF。返回 (是否成功, 说明文字)。
+    JPEG（RGB/灰度、无 EXIF 旋转）原样嵌入（DCTDecode，不重新压缩）；
+    其他格式经 Pillow 解码后用 Flate 无损压缩嵌入；透明图先合到白底上。
+    页面为 A4（横图用横向），图片按比例放进页边距内、居中，不裁剪。
+    """
+    from PIL import Image, ImageOps
+    import zlib
+
+    src = Path(src)
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    target = outdir / (src.stem + ".pdf")
+    try:
+        im = Image.open(src)
+        im.load()  # 确认文件确实能解码
+    except Exception as e:  # noqa: BLE001
+        return False, "打不开图片：%s" % e
+    w, h = im.size
+    if w <= 0 or h <= 0:
+        return False, "图片尺寸无效"
+    try:
+        orient = im.getexif().get(0x0112, 1) if hasattr(im, "getexif") else 1
+    except Exception:  # noqa: BLE001
+        orient = 1
+
+    suffix = src.suffix.lower()
+    if suffix in (".jpg", ".jpeg") and orient in (1, None) and im.mode in ("RGB", "L"):
+        # JPEG 原样嵌入，不重新压缩
+        data = src.read_bytes()
+        filt = "/DCTDecode"
+        colorspace = "/DeviceRGB" if im.mode == "RGB" else "/DeviceGray"
+        width, height = w, h
+    else:
+        # 无损通道：按 EXIF 方向转正，解码后 Flate 压缩
+        img = ImageOps.exif_transpose(im)
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            img = img.convert("RGBA")
+            bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(bg, img).convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        width, height = img.size
+        data = zlib.compress(img.tobytes(), 9)
+        filt = "/FlateDecode"
+        colorspace = "/DeviceRGB"
+
+    # 页面：A4，横图用横向；图片按比例放进页边距内、居中
+    if width >= height:
+        pw, ph = 842.0, 595.0
+    else:
+        pw, ph = 595.0, 842.0
+    margin = 36.0
+    scale = min((pw - 2 * margin) / width, (ph - 2 * margin) / height)
+    dw, dh = width * scale, height * scale
+    x = (pw - dw) / 2
+    y = (ph - dh) / 2
+    content = ("q %.2f 0 0 %.2f %.2f %.2f cm /Im0 Do Q" % (dw, dh, x, y)).encode()
+
+    objs = []
+    objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objs.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    objs.append(("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.0f %.0f] "
+                 "/Resources << /XObject << /Im0 4 0 R >> >> "
+                 "/Contents 5 0 R >>" % (pw, ph)).encode())
+    objs.append(("<< /Type /XObject /Subtype /Image /Width %d /Height %d "
+                 "/ColorSpace %s /BitsPerComponent 8 /Filter %s "
+                 "/Length %d >>" % (width, height, colorspace, filt, len(data))).encode()
+                + b"\nstream\n" + data + b"\nendstream")
+    objs.append(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += ("%d 0 obj\n" % i).encode() + body + b"\nendobj\n"
+    xref_pos = len(out)
+    out += ("xref\n0 %d\n" % (len(objs) + 1)).encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += ("%010d 00000 n \n" % off).encode()
+    out += ("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+            % (len(objs) + 1, xref_pos)).encode()
+    try:
+        target.write_bytes(bytes(out))
+    except Exception as e:  # noqa: BLE001
+        return False, "写 PDF 失败：%s" % e
+    return True, "已生成 " + target.name
+
+
+def convert_one(src, outdir, soffice):
+    """按扩展名分流：图片直接无损转，Office 走 LibreOffice。
+    soffice 为 None 时 Office 文件转不了，但图片照常转。"""
+    src = Path(src)
+    if src.suffix.lower() in IMAGE_EXTS:
+        return image_to_pdf(src, outdir)
+    if soffice is None:
+        return False, "需要 LibreOffice 才能转 Office 文件（图片不需要）"
+    return convert_file(soffice, src, outdir)
+
+
 def convert_many(soffice, files, outdir=None, log=print):
     """批量转换。outdir 为 None 时输出到各源文件所在目录。返回 (成功数, 失败数)。"""
     ok = fail = 0
@@ -77,7 +185,7 @@ def convert_many(soffice, files, outdir=None, log=print):
         src = Path(f)
         dest = Path(outdir) if outdir else src.parent
         log(f"[{i}/{len(files)}] 正在转换：{src.name}")
-        good, msg = convert_file(soffice, src, dest)
+        good, msg = convert_one(src, dest, soffice)
         if good:
             ok += 1
             log(f"    ✓ {src.name} -> {msg}")
@@ -94,13 +202,16 @@ def run_cli(args):
         print(f"跳过（找不到文件）：{s}")
     files = [f for f in files if Path(f).suffix.lower() in SUPPORTED]
     if not files:
-        print("没有可转换的 Excel/Word 文件。支持：.xls .xlsx .doc .docx")
+        print("没有可转换的文件。支持：.xls .xlsx .doc .docx "
+              ".png .jpg .jpeg .bmp .gif .tif .tiff .webp")
         return 1
-    soffice = find_soffice()
-    if not soffice:
-        print("未找到 LibreOffice，请先免费安装：%s" % LIBREOFFICE_URL)
-        return 2
-    print(f"LibreOffice：{soffice}")
+    office_files = [f for f in files if Path(f).suffix.lower() in OFFICE_EXTS]
+    soffice = find_soffice() if office_files else None
+    if office_files and not soffice:
+        print("未找到 LibreOffice，Office 文件转不了，请先免费安装：%s" % LIBREOFFICE_URL)
+        print("（图片文件不需要 LibreOffice，照常转。）")
+    elif soffice:
+        print(f"LibreOffice：{soffice}")
     ok, fail = convert_many(soffice, files, args.outdir)
     print(f"完成：成功 {ok} 个，失败 {fail} 个。")
     return 0 if fail == 0 else 3
@@ -116,8 +227,8 @@ def run_gui():
     soffice = find_soffice()
     root = tk.Tk()
     root.title(f"{APP_NAME} v{VERSION}")
-    root.geometry("680x520")
-    root.minsize(620, 460)
+    root.geometry("680x540")
+    root.minsize(620, 480)
 
     files_var = []
     msg_q = queue.Queue()
@@ -126,14 +237,16 @@ def run_gui():
     # --- 顶部说明 ---
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
-    ttk.Label(top, text="把 Excel / Word 文件批量转换为 PDF",
+    ttk.Label(top, text="把 Excel / Word / 图片文件批量转换为 PDF",
               font=("", 13, "bold")).pack(anchor="w")
+    ttk.Label(top, text="图片（PNG / JPG 等）直接无损转，不用 LibreOffice；Office 文件需要本机装 LibreOffice。",
+              foreground="gray").pack(anchor="w", pady=(2, 0))
     if soffice:
         ttk.Label(top, text=f"已找到 LibreOffice：{soffice}",
                   foreground="green").pack(anchor="w", pady=(2, 0))
     else:
         ttk.Label(top,
-                  text="未找到 LibreOffice！请先免费安装：\n" + LIBREOFFICE_URL,
+                  text="未找到 LibreOffice！Office 文件转不了（图片照常转），请先免费安装：\n" + LIBREOFFICE_URL,
                   foreground="red").pack(anchor="w", pady=(2, 0))
 
     # --- 文件列表 ---
@@ -150,10 +263,14 @@ def run_gui():
         for f in files_var:
             listbox.insert("end", f)
 
+    all_patterns = "*.xls *.xlsx *.doc *.docx *.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"
+
     def add_files():
         paths = filedialog.askopenfilenames(
-            title="选择 Excel / Word 文件",
-            filetypes=[("Excel/Word 文件", "*.xls *.xlsx *.doc *.docx"),
+            title="选择要转换的文件",
+            filetypes=[("支持的文件", all_patterns),
+                       ("Excel/Word 文件", "*.xls *.xlsx *.doc *.docx"),
+                       ("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
                        ("所有文件", "*.*")])
         for p in paths:
             if Path(p).suffix.lower() in SUPPORTED and p not in files_var:
@@ -163,7 +280,7 @@ def run_gui():
         refresh_list()
 
     def add_folder():
-        d = filedialog.askdirectory(title="选择文件夹（批量转里面的 Excel/Word 文件）")
+        d = filedialog.askdirectory(title="选择文件夹（批量转里面的文件）")
         if not d:
             return
         n = 0
@@ -263,10 +380,13 @@ def run_gui():
         if not files_var:
             messagebox.showinfo("提示", "请先添加要转换的文件。")
             return
-        if not soffice:
+        office_in_list = [f for f in files_var
+                          if Path(f).suffix.lower() in OFFICE_EXTS]
+        if office_in_list and not soffice:
             messagebox.showerror(
                 "未找到 LibreOffice",
-                "请先免费安装 LibreOffice，再用本软件转换：\n" + LIBREOFFICE_URL)
+                "列表里有 Excel/Word 文件，需要先免费安装 LibreOffice 才能转：\n"
+                + LIBREOFFICE_URL + "\n（只转图片的话，把 Office 文件从列表里移除即可。）")
             return
         busy["run"] = True
         convert_btn.configure(state="disabled")
@@ -281,7 +401,7 @@ def run_gui():
                 src = Path(f)
                 dest = Path(outdir) if outdir else src.parent
                 log(f"[{i}/{total}] 正在转换：{src.name}")
-                good, msg = convert_file(soffice, src, dest)
+                good, msg = convert_one(src, dest, soffice)
                 if good:
                     ok += 1
                     log(f"    ✓ {src.name} -> {msg}")
@@ -326,15 +446,16 @@ def run_gui():
     convert_btn.pack(side="right", padx=(6, 0))
     ttk.Button(bottom, text="打开输出文件夹", command=open_outdir).pack(side="right")
 
-    log(f"{APP_NAME} v{VERSION} 已启动。支持 .xls/.xlsx/.doc/.docx 转 PDF。")
+    log(f"{APP_NAME} v{VERSION} 已启动。支持 .xls/.xlsx/.doc/.docx 和图片 .png/.jpg/.jpeg/.bmp/.gif/.tif/.tiff/.webp 转 PDF。")
     if not soffice:
-        log("未找到 LibreOffice，转换前请先安装（免费）：" + LIBREOFFICE_URL)
+        log("未找到 LibreOffice，Office 文件转不了（图片照常转），请先安装（免费）：" + LIBREOFFICE_URL)
     root.after(120, poll_log)
     root.mainloop()
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Office转PDF：把 Excel/Word 文件批量转换为 PDF")
+    p = argparse.ArgumentParser(
+        description="Office转PDF：把 Excel/Word/图片文件批量转换为 PDF")
     p.add_argument("files", nargs="*", help="要转换的文件（可多个）")
     p.add_argument("-o", "--outdir", default=None, help="输出目录（默认输出到各源文件所在目录）")
     p.add_argument("--version", action="version", version=f"{APP_NAME} v{VERSION}")
